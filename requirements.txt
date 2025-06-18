@@ -24,3 +24,8 @@ wcwidth==0.2.13
 
 requests
 beautifulsoup4
+
+PyPDF2
+python-docx
+python-pptx
+openpyxl
