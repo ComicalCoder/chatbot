@@ -34,3 +34,10 @@ PyPDF2
 python-docx
 python-pptx
 openpyxl
+
+torch
+transformers
+langchain
+faiss-cpu
+sentence-transformers
+huggingface_hub
