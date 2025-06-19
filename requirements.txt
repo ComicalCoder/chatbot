@@ -29,3 +29,8 @@ PyPDF2
 python-docx
 python-pptx
 openpyxl
+
+PyPDF2
+python-docx
+python-pptx
+openpyxl
