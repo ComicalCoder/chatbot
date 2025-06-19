@@ -6,4 +6,4 @@ __pycache__/
 data/
 models/
 *.sqlite3
-django-env/
+django-env/.cache/
