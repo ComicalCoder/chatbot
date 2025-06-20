@@ -45,3 +45,4 @@ huggingface_hub
 sentencepiece
 protobuf
 pdfplumber
+langchain-huggingface
