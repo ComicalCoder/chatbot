@@ -46,3 +46,4 @@ sentencepiece
 protobuf
 pdfplumber
 langchain-huggingface
+bitsandbytes
