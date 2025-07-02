@@ -1,12 +1,6 @@
-__pycache__/
 *.pyc
-*.pyo
-*.pyd
-.env
-data/
-models/
+__pycache__/
 *.sqlite3
-django-env/.cache/
+django-env/
 .cache/
-input_files/
-input_files/
+*.log
