@@ -14,17 +14,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_mistral():
-    model_name = "mistralai/Mistral-7B-Instruct-v0.3"
+    model_name = "/home/dilevan/chatbot/mixtral_model"
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_quant_type="nf4"
+        bnb_4bit_quant_type="nf4",
+        llm_int8_enable_fp32_cpu_offload=True  # Enable CPU offload
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=os.environ.get("HF_HOME"))
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quantization_config,
-        device_map="auto",
+        device_map="auto",  # Auto-distribute across GPU and CPU
         cache_dir=os.environ.get("HF_HOME"),
         low_cpu_mem_usage=True
     )
