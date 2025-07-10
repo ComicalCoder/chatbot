@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_mistral():
-    model_name = "/home/dilevan/chatbot/mixtral_model"
+    model_name = "mistralai/Mistral-7B-Instruct-v0.3"
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
@@ -71,11 +71,10 @@ def query_rag(query, tokenizer, model, vector_store, top_k=7):
     prompt = f"""Answer the following question based on the provided context. 
     Respond in {'Malay' if is_malay else 'English'}, matching the language of the question. 
     Provide a concise, natural response without mentioning sources or technical details like JSON files or URLs. 
-    Ensure consistency across languages ('director' and 'pengarah' refer to Ernywati Dewi Abas).
-    - For director questions, state the director’s name (Ernywati Dewi Abas) if available, otherwise say information is unavailable.
-    - For working hours questions, state JPKN’s hours as Monday to Friday, 7:30 AM to 5:00 PM, with a lunch break from 1:00 PM to 2:00 PM (or equivalent in Malay).
-    - For questions about JPAN_700-28(44).pdf, summarize its main purpose as JPKN’s responsibilities in ICT services, state government data center management, and digital transformation initiatives in Sabah. Avoid mentioning tenders (e.g., toner, accessories) or anti-corruption plans.
-    If context is insufficient, state that official JPKN sources should be consulted.
+    Ensure consistency across languages.
+    Expect sources to be in mostly in Malay. 
+    Do translation from English to Malay to the prompts to easier find data.
+    
 
     Context:
     {context}
