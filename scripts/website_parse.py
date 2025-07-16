@@ -1,323 +1,407 @@
-import requests
-import hashlib
 import os
 import json
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from multiprocessing import Pool
-from time import sleep
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
-import io
+import hashlib
 import re
 import unicodedata
+from collections import deque
+from urllib.parse import urljoin, urlparse
+import time
 
-# --- CONFIG ---
-BASE_URL = "https://jpkn.sabah.gov.my/"
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-MAX_DEPTH = 20
-REQUEST_DELAY = 1
-CHUNK_SIZE = 500
-NUM_WORKERS = 6
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from playwright.sync_api import sync_playwright, Page, Locator
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-def chunk_text(text, chunk_size=CHUNK_SIZE):
-    """Split text into RAG-friendly chunks."""
-    words = text.split()
-    chunks = []
-    current = []
-    for word in words:
-        current.append(word)
-        if len(" ".join(current)) >= chunk_size:
-            chunks.append(" ".join(current))
-            current = []
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
+# --- CONFIGURATION ---
+BASE_URL = "https://jpkn.sabah.gov.my/"  # Starting URL for the crawler
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data") # Directory to save JSON output
+MAX_PAGES_TO_CRAWL = 100 # Limit the number of pages to crawl
+CRAWL_DELAY_SECONDS = 1 # Delay between page visits to be polite to the server
+PLAYWRIGHT_TIMEOUT_MS = 90000 # Increased timeout to 90 seconds
 
-def clean_ocr_text(text):
-    """Clean OCR text to fix spacing, errors, and remove noise."""
-    # Remove footer and noise
-    text = re.sub(r"(?i)(SABAH\.?GOV\.?MY|Tingkat 6 & 7|Menara Kinabalu|Teluk Likas|88400 Kota Kinabalu|No Tel/faks|WAKTU PEJABAT|Hari Bekerja|Loading\.\.\.|SABAH MAJU JAYA|© Hak Cipta|JPKN.*BAYU|Pelawat Hari Ini|Jumlah Pelawat|Jumlah Capaian|Last updated|Dasar Privasi|Notis Penafian|Webmail|PAKSi|E-Circular)", "", text)
-    text = re.sub(r"[©\(\)\*\!\|\[\]\{\}]", "", text)
-    # Fix OCR errors for /188-2/
-    replacements = {
-        r"\bVIS\b|\bV\s*i\s*s\s*i\b|\bV1S1\b": "Visi",
-        r"\bMIS\b|\bM\s*i\s*s\s*i\b|\bM1S1\b": "Misi",
-        r"\bMOTTO\b|\bMotoo\b|\bM0T0\b": "Moto",
-        r"\bDAARUji\b|\bDasar\s*k\s*u\s*a\s*l\s*i\s*t\s*i\b|\bD\s*a\s*s\s*a\s*r\b": "Dasar Kualiti",
-        r"\bOGlg\b|\bO\s*b\s*j\s*e\s*k\s*t\s*i\s*f\b|\b0bj3kt1f\b": "Objektif"
-    }
-    for pattern, replacement in replacements.items():
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    # Normalize whitespace and add spacing after headers
-    text = re.sub(r"(?i)(Visi|Misi|Moto|Dasar Kualiti|Objektif)(?=\S)", r"\1 ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    print(f"[Debug] Cleaned OCR text: {text[:200]}...")
-    return text
+# Text splitting configuration for extracted content
+TEXT_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    length_function=len,
+    is_separator_regex=False,
+)
 
-def extract_image_text(image_url):
-    """Extract text from an image using enhanced OCR."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(image_url, headers=headers, timeout=10)
-        response.raise_for_status()
-        image = Image.open(io.BytesIO(response.content))
-        texts = []
-        # Multi-scale preprocessing
-        for scale in [1.0, 1.5]:
-            scaled_image = image.resize((int(image.width * scale), int(image.height * scale)), Image.Resampling.LANCZOS)
-            for threshold in [120, 140, 160]:
-                gray = scaled_image.convert("L")
-                enhanced = ImageEnhance.Contrast(gray).enhance(3.0)
-                enhanced = enhanced.filter(ImageFilter.SHARPEN)
-                binary = enhanced.point(lambda x: 0 if x < threshold else 255)
-                config = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:.- "
-                text = pytesseract.image_to_string(binary, lang="eng+msa", config=config)
-                if text.strip():
-                    texts.append(clean_ocr_text(text))
-        combined_text = " ".join([t for t in texts if t])
-        print(f"[Debug] Combined OCR text for {image_url}: {combined_text[:200]}...")
-        return combined_text.strip()
-    except Exception as e:
-        print(f"[ERROR] Failed to extract text from image {image_url}: {e}")
-        return ""
+# File extensions to ignore during crawling (Playwright cannot parse these as HTML)
+IGNORED_FILE_EXTENSIONS = (
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.jpg', '.jpeg', '.png', 
+    '.gif', '.bmp', '.svg', '.mp3', '.mp4', '.avi', '.mov', '.webp'
+)
 
-def is_valid_url(url):
-    """Check if URL is likely valid before scraping."""
-    return url.startswith(BASE_URL) and not any(x in url for x in ["#", ".pdf", ".jpg", ".jpeg", ".png"])
+# --- HELPER FUNCTIONS ---
 
-def normalize_text(text):
+def normalize_text(text: str) -> str:
     """Normalize text: fix whitespace and Unicode issues."""
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def scrape_page(url):
-    """Extract and return structured content from a page."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+def sanitize_metadata(metadata: dict) -> dict:
+    """
+    Sanitizes metadata dictionary to ensure all values are simple types
+    (str, int, float, bool, or None) for ChromaDB compatibility.
+    Converts lists to comma-separated strings.
+    """
+    sanitized = {}
+    for key, value in metadata.items():
+        if isinstance(value, list):
+            sanitized[key] = ", ".join(map(str, value))
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            sanitized[key] = value
+        else:
+            sanitized[key] = str(value) # Convert any other complex types to string
+    return sanitized
 
-        print(f"[Debug] Page fetched for {url}")
+def sanitize_filename(text: str, max_length: int = 50) -> str:
+    """
+    Sanitizes a string to be used as a filename.
+    Removes invalid characters, replaces spaces, and truncates.
+    """
+    # Replace spaces with underscores
+    s = text.replace(" ", "_")
+    # Remove characters that are not alphanumeric, underscore, or hyphen
+    s = re.sub(r"[^\w.-]", "", s)
+    # Replace multiple underscores/hyphens with a single one
+    s = re.sub(r"[_.-]+", "_", s)
+    # Trim leading/trailing underscores/hyphens
+    s = s.strip("_.-")
+    # Truncate to max_length
+    return s[:max_length]
 
-        # Remove scripts and styles
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-
-        # Remove footer
-        for footer in soup.find_all("footer"):
-            footer.decompose()
-
-        # Target main content
-        main_content = (soup.find("div", id="content") or
-                        soup.find("div", class_=re.compile("entry-content|post-content")) or
-                        soup.find("main") or
-                        soup.body)
-        if not main_content:
-            print(f"[Debug] No main content found for {url}")
-            return None
-
-        print(f"[Debug] Main content tags for {url}: {main_content.name}, classes: {main_content.get('class', [])}")
-
-        sections = []
-        table_data = []
-        structured_data = []
-
-        # Handle accordion-based directory
-        if "direktori" in url:
-            accordions = main_content.find_all("div", class_=re.compile("et_pb_toggle|et_pb_accordion_item"))
-            for accordion in accordions:
-                title = accordion.find("h5", class_="et_pb_toggle_title")
-                section_title = title.get_text(strip=True) if title else "Unknown Section"
-                tables = accordion.find_all("table")
-                for table in tables:
-                    rows = table.find_all("tr")
-                    for row in rows:
-                        cols = row.find_all("td")
-                        if len(cols) >= 4:
-                            name = cols[1].get_text(strip=True) if len(cols) > 1 else ""
-                            jawatan = cols[2].get_text(strip=True) if len(cols) > 2 else ""
-                            phone = cols[3].get_text(strip=True) if len(cols) > 3 else ""
-                            email = cols[4].get_text(strip=True).replace("[a]", "@") if len(cols) > 4 else ""
-                            if name and re.search(r"[A-Za-z]", name) and not re.match(r"^(Facebook|RSS|Twitter|YouTube|DIREKTORI|KETUA-KETUA|BAHAGIAN)$", name, re.IGNORECASE):
-                                table_data.append({
-                                    "name": name,
-                                    "jawatan": jawatan,
-                                    "phone": phone,
-                                    "email": email,
-                                    "section": section_title
-                                })
-                                sections.append(f"{section_title}: {name}, {jawatan}, {phone}, {email}")
-                    print(f"[Debug] Table rows in {section_title} for {url}: {[row.get_text(strip=True) for row in rows]}")
-
-        # Handle mission/vision page (/188-2/)
-        elif "188-2" in url:
-            # Target specific containers
-            containers = main_content.find_all("div", class_=re.compile("et_pb_text|et_pb_module|et_pb_section"))
-            img_texts = []
-            expected_headers = ["Visi", "Misi", "Moto", "Dasar Kualiti", "Objektif"]
-            header_index = 0
-            for container in containers:
-                images = container.find_all("img", src=True)
-                print(f"[Debug] Found {len(images)} images in container for {url}")
-                for img in images:
-                    img_url = urljoin(url, img["src"])
-                    if img_url.endswith((".png", ".jpg", ".jpeg")) and "logojpkn" not in img_url and "banner" not in img_url:
-                        print(f"[Debug] Processing image: {img_url}")
-                        img_text = extract_image_text(img_url)
-                        if img_text and header_index < len(expected_headers):
-                            # Assign header based on expected order
-                            header = expected_headers[header_index]
-                            content = img_text.strip()
-                            if content:
-                                structured_data.append({
-                                    "header": header,
-                                    "content": content
-                                })
-                                sections.append(f"{header}: {content}")
-                                print(f"[Debug] Assigned header {header} with content: {content[:100]}...")
-                                header_index += 1
-                            img_texts.append(img_text)
-            combined_text = " ".join(img_texts)
-            print(f"[Debug] Combined OCR text for {url}: {combined_text[:200]}...")
-            # Fallback regex splitting if structured_data is incomplete
-            if len(structured_data) < len(expected_headers):
-                headers = expected_headers
-                pattern = r"(?i)\b(" + "|".join(headers) + r")\b\s*[:.]?\s*"
-                parts = re.split(pattern, combined_text)
-                current_header = None
-                for i in range(0, len(parts), 2):
-                    part = parts[i].strip()
-                    if i + 1 < len(parts):
-                        header = parts[i + 1].strip()
-                        if header.lower() in [h.lower() for h in headers]:
-                            if current_header and part:
-                                structured_data.append({
-                                    "header": current_header,
-                                    "content": part
-                                })
-                                sections.append(f"{current_header}: {part}")
-                                print(f"[Debug] Fallback content for {current_header} at {url}: {part[:100]}...")
-                            current_header = header
-                        elif current_header and part:
-                            structured_data.append({
-                                "header": current_header,
-                                "content": part
-                            })
-                            sections.append(f"{current_header}: {part}")
-                            print(f"[Debug] Fallback content for {current_header} at {url}: {part[:100]}...")
-                if current_header and parts[-1].strip():
-                    structured_data.append({
-                        "header": current_header,
-                        "content": parts[-1].strip()
-                    })
-                    sections.append(f"{current_header}: {parts[-1].strip()}")
-                    print(f"[Debug] Fallback content for {current_header} at {url}: {parts[-1][:100]}...")
-
-        # General text extraction (excluding headers)
-        for tag in main_content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "div", "span"]):
-            text = normalize_text(tag.get_text(strip=True))
-            if text and not any(h in text for h in ["Visi", "Misi", "Moto", "Dasar Kualiti", "Objektif"]):
-                sections.append(text)
-        print(f"[Debug] Extracted {len(sections)} text sections for {url}")
-
-        full_text = "\n".join(sections)
-        chunks = chunk_text(full_text)
-
-        print(f"[Debug] Final extracted text for {url}: {full_text[:200]}...")
-
-        return {
-            "url": url,
-            "title": soup.title.string.strip() if soup.title else "",
-            "raw_text": full_text,
-            "chunks": chunks,
-            "table_data": table_data if table_data else None,
-            "structured_data": structured_data if structured_data else None
-        }
-    except requests.exceptions.HTTPError as e:
-        print(f"HTTP error scraping {url}: {e}")
-        return None
-    except Exception as e:
-        print(f"Error scraping {url}: {e}")
-        return None
-
-def save_text_as_json(url, data):
-    """Save page content to a JSON file."""
-    if not data:
+def save_documents_to_json(documents: list[Document], page_url: str, page_title: str):
+    """
+    Saves a list of Document objects to a JSON file.
+    Each original page will have its own JSON file.
+    The filename will be based on the page title and a hash of the URL.
+    """
+    if not documents:
         return
-    filename_hash = hashlib.md5(url.encode()).hexdigest()
-    filename = url.replace("https://", "").replace("/", "_").replace("?", "_").replace("&", "_")
-    if len(filename) > 100:
-        filename = filename_hash
-    filepath = os.path.join(OUTPUT_DIR, f"{filename}.json")
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def get_links(url):
-    """Extract internal links from a page."""
+    sanitized_title = sanitize_filename(page_title)
+    page_url_short_hash = hashlib.md5(page_url.encode()).hexdigest()[:12] # Use first 12 chars
+
+    filename = f"{sanitized_title}_{page_url_short_hash}.json"
+    filepath = os.path.join(OUTPUT_DIR, filename)
+
+    doc_dicts = []
+    for doc in documents:
+        doc_dicts.append({
+            "page_content": doc.page_content,
+            "metadata": sanitize_metadata(doc.metadata) # This line calls sanitize_metadata
+        })
+
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        links = set()
-        for a in soup.find_all("a", href=True):
-            href = urljoin(BASE_URL, a["href"])
-            if not href.startswith(BASE_URL):
-                continue
-            if any(x in href for x in ["uploads/", "#", ".pdf", ".jpg", ".jpeg", ".png", "galeri", "Text_Pic_Single.php", "hello-world", "author/"]):
-                continue
-            if is_valid_url(href):
-                links.add(href)
-        print(f"[Debug] Found {len(links)} links for {url}")
-        return links
-    except requests.exceptions.HTTPError as e:
-        print(f"HTTP error getting links from {url}: {e}")
-        return set()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(doc_dicts, f, ensure_ascii=False, indent=2)
+        print(f"  Saved {len(documents)} document chunks to {filepath}")
     except Exception as e:
-        print(f"Error getting links from {url}: {e}")
-        return set()
+        print(f"  [ERROR] Failed to save documents to {filepath}: {e}")
 
-def process_url(args):
-    """Process a single URL: scrape, save, and extract links."""
-    url, depth, max_depth = args
-    if depth > max_depth:
-        return []
+def extract_text_and_metadata(page: Page, url: str) -> list[Document]:
+    """
+    Extracts all visible text from the page, including handling dropdowns/collapsible sections,
+    and captures header/footer content with specific metadata.
+    """
+    documents = []
+    page_title = page.title() if page.title() else "No Title"
+    current_url_hash = hashlib.md5(url.encode()).hexdigest()
+
+    print(f"  Extracting content from: {url}")
+    print(f"  Page Title: {page_title}")
+
+    # --- Extract Header Content ---
+    header_selectors = [
+        "header", 
+        "[role='banner']", 
+        "#header", 
+        ".main-header", 
+        ".site-header",
+        ".header-area", 
+        ".top-bar" 
+    ]
+    header_content_extracted = False
+    for selector in header_selectors:
+        try:
+            header_locator = page.locator(selector)
+            if header_locator.count() > 0:
+                header_text_list = header_locator.all_text_contents()
+                header_text = normalize_text(" ".join(header_text_list))
+                
+                if header_text:
+                    documents.extend(TEXT_SPLITTER.create_documents([header_text], metadatas=[{
+                        "url": url,
+                        "page_title": page_title,
+                        "type": "header",
+                        "source_file": current_url_hash,
+                        "selector_used": selector
+                    }]))
+                    print(f"    Extracted header content using '{selector}'. Length: {len(header_text)} chars.")
+                    header_content_extracted = True
+                    break 
+                else:
+                    print(f"    [DEBUG] Header selector '{selector}' found, but no text content. Inner HTML (first 200 chars): {header_locator.inner_html()[:200]}...")
+            else:
+                print(f"    [DEBUG] Header selector '{selector}' not found.")
+        except Exception as e:
+            print(f"    [Warning] Error with header selector '{selector}': {e}")
+    if not header_content_extracted:
+        print("    No header content extracted using available selectors.")
+
+    # --- Extract Footer Content ---
+    footer_selectors = [
+        "footer", 
+        "[role='contentinfo']", 
+        "#footer", 
+        ".main-footer", 
+        ".site-footer",
+        ".footer-area", 
+        ".contact-info", 
+        ".widget-area" 
+    ]
+    footer_content_extracted = False
+    for selector in footer_selectors:
+        try:
+            footer_locator = page.locator(selector)
+            if footer_locator.count() > 0:
+                footer_text_list = footer_locator.all_text_contents()
+                footer_text = normalize_text(" ".join(footer_text_list))
+                
+                if footer_text:
+                    documents.extend(TEXT_SPLITTER.create_documents([footer_text], metadatas=[{
+                        "url": url,
+                        "page_title": page_title,
+                        "type": "footer",
+                        "source_file": current_url_hash,
+                        "selector_used": selector
+                    }]))
+                    print(f"    Extracted footer content using '{selector}'. Length: {len(footer_text)} chars.")
+                    footer_content_extracted = True
+                    break 
+                else:
+                    print(f"    [DEBUG] Footer selector '{selector}' found, but no text content. Inner HTML (first 200 chars): {footer_locator.inner_html()[:200]}...")
+            else:
+                print(f"    [DEBUG] Footer selector '{selector}' not found.")
+        except Exception as e:
+            print(f"    [Warning] Error with footer selector '{selector}': {e}")
+    if not footer_content_extracted:
+        print("    No footer content extracted using available selectors.")
+
+
+    # --- Handle Dropdowns/Collapsible Sections ---
+    dropdown_selectors = [
+        "[data-toggle='collapse']", 
+        "[aria-expanded='false']",  
+        ".accordion-header",        
+        ".collapsible-btn",         
+        "button:has-text('Read More')", 
+        "a:has-text('View Details')"
+    ]
+    
+    for selector in dropdown_selectors:
+        try:
+            collapsible_elements = page.locator(selector).all()
+            if collapsible_elements:
+                print(f"    Found {len(collapsible_elements)} potential collapsible elements with selector '{selector}'.")
+                for i, element in enumerate(collapsible_elements):
+                    if element.is_visible():
+                        try:
+                            element.click(timeout=3000) 
+                            page.wait_for_timeout(500) 
+                            
+                            expanded_text_area_list = page.locator("body").all_text_contents()
+                            expanded_content = normalize_text(" ".join(expanded_text_area_list))
+
+                            if expanded_content:
+                                documents.extend(TEXT_SPLITTER.create_documents([expanded_content], metadatas=[{
+                                    "url": url,
+                                    "page_title": page_title,
+                                    "type": "collapsible_section_text", 
+                                    "section_title": normalize_text(element.text_content()[:100]), 
+                                    "source_file": current_url_hash
+                                }]))
+                                print(f"      Expanded and extracted content from element {i+1} using '{selector}'.")
+
+                        except Exception as click_err:
+                            print(f"      [Warning] Could not click or extract from collapsible element {i+1} with selector '{selector}': {click_err}")
+        except Exception as sel_err:
+            print(f"    [Warning] Error finding elements with selector '{selector}': {sel_err}")
+
+    # --- Extract Table Data ---
+    tables = page.locator("table").all()
+    if tables:
+        print(f"    Found {len(tables)} tables.")
+        for i, table in enumerate(tables):
+            try:
+                headers = [normalize_text(th.text_content()) for th in table.locator("th").all()]
+                rows = table.locator("tbody tr").all()
+                for r_idx, row in enumerate(rows):
+                    cells = [normalize_text(td.text_content()) for td in row.locator("td").all()]
+                    
+                    row_data_str = ""
+                    if headers and len(headers) == len(cells):
+                        row_data_str = ", ".join(f"{h}: {c}" for h, c in zip(headers, cells))
+                    else:
+                        row_data_str = ", ".join(cells) 
+
+                    if row_data_str:
+                        documents.extend(TEXT_SPLITTER.create_documents([row_data_str], metadatas=[{
+                            "url": url,
+                            "page_title": page_title,
+                            "type": "table_data",
+                            "table_index": i,
+                            "row_index": r_idx,
+                            "table_headers": ", ".join(headers) if headers else None,
+                            "source_file": current_url_hash
+                        }]))
+                print(f"      Extracted content from table {i+1}.")
+            except Exception as e:
+                print(f"      [Warning] Could not extract content from table {i+1}: {e}")
+
+    # --- Extract Main Body Text ---
     try:
-        print(f"[Depth {depth}] Scraping: {url}")
-        data = scrape_page(url)
-        save_text_as_json(url, data)
-        sleep(REQUEST_DELAY)
-        links = get_links(url)
-        return [(link, depth + 1, max_depth) for link in links]
+        main_content_locator = page.locator("main, article, .main-content, #content")
+        if main_content_locator.count() > 0:
+            main_text_list = main_content_locator.all_text_contents()
+            main_text = normalize_text(" ".join(main_text_list))
+            if main_text:
+                documents.extend(TEXT_SPLITTER.create_documents([main_text], metadatas=[{
+                    "url": url,
+                    "page_title": page_title,
+                    "type": "main_content",
+                    "source_file": current_url_hash
+                }]))
+                print("    Extracted main content.")
+        else:
+            body_text_list = page.locator("body").all_text_contents()
+            body_text = normalize_text(" ".join(body_text_list))
+            if body_text:
+                documents.extend(TEXT_SPLITTER.create_documents([body_text], metadatas=[{
+                    "url": url,
+                    "page_title": page_title,
+                    "type": "full_page_content",
+                    "source_file": current_url_hash
+                }]))
+                print("    Extracted full page content (no specific main area found).")
+
     except Exception as e:
-        print(f"Error processing {url}: {e}")
-        return []
+        print(f"    [Warning] Could not extract main/full page content: {e}")
 
-def parallel_crawl(start_url, max_depth=MAX_DEPTH):
-    """Crawl the website starting from start_url."""
-    seen = set()
-    queue = [(start_url, 0, max_depth)]
-    iteration = 0
+    return documents
 
-    with Pool(NUM_WORKERS) as pool:
-        while queue:
-            queue = [item for item in queue if item[0] not in seen]
-            if not queue:
-                break
-            for item in queue:
-                seen.add(item[0])
+def get_internal_links(page: Page, base_url: str) -> set[str]:
+    """
+    Extracts all unique internal links from the current page,
+    ignoring specific file extensions.
+    """
+    internal_links = set()
+    base_netloc = urlparse(base_url).netloc
 
-            print(f"\n🔄 Iteration {iteration}: Processing {len(queue)} URLs...\n")
-            results = pool.map(process_url, queue)
-            queue = [item for sublist in results for item in sublist if item[0] not in seen]
-            iteration += 1
+    for link_locator in page.locator("a[href]").all():
+        try:
+            href = link_locator.get_attribute("href")
+            if href:
+                full_url = urljoin(page.url, href)
+                parsed_full_url = urlparse(full_url)
 
-def main():
-    parallel_crawl(BASE_URL)
+                if parsed_full_url.path.lower().endswith(IGNORED_FILE_EXTENSIONS):
+                    print(f"    [DEBUG] Skipping link to ignored file type: {full_url}")
+                    continue
 
+                if (parsed_full_url.netloc == base_netloc and
+                    parsed_full_url.scheme in ['http', 'https'] and
+                    not parsed_full_url.fragment and 
+                    not full_url.startswith("mailto:") and
+                    not full_url.startswith("tel:")):
+                    
+                    normalized_url = parsed_full_url._replace(query="", fragment="").geturl()
+                    internal_links.add(normalized_url)
+        except Exception as e:
+            pass 
+
+    return internal_links
+
+# --- MAIN CRAWLER FUNCTION ---
+
+def crawl_website(base_url: str, output_dir: str, max_pages: int, delay: int, timeout_ms: int):
+    """
+    Crawls a website, extracts content, and saves it to JSON files.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+    else:
+        print(f"Output directory already exists: {output_dir}")
+        print("Clearing existing JSON files in output directory.")
+        for file in os.listdir(output_dir):
+            if file.endswith(".json"):
+                os.remove(os.path.join(output_dir, file))
+
+
+    visited_urls = set()
+    urls_to_visit = deque([base_url])
+    crawled_page_count = 0
+
+    # base_url_hash is no longer used for filename, but kept for metadata consistency if needed
+    base_url_hash = hashlib.md5(base_url.encode()).hexdigest() 
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True) 
+        context = browser.new_context()
+        page = context.new_page()
+
+        print(f"Starting crawl from: {base_url}")
+
+        while urls_to_visit and crawled_page_count < max_pages:
+            current_url = urls_to_visit.popleft()
+
+            if current_url in visited_urls:
+                print(f"Skipping already visited URL: {current_url}")
+                continue
+
+            print(f"\nCrawling page {crawled_page_count + 1}/{max_pages}: {current_url}")
+            visited_urls.add(current_url)
+            crawled_page_count += 1
+
+            try:
+                page.goto(current_url, wait_until="load", timeout=timeout_ms) 
+                page.wait_for_timeout(3000) 
+                
+                documents = extract_text_and_metadata(page, current_url)
+                
+                page_title_for_filename = page.title() if page.title() else "no_title"
+                save_documents_to_json(documents, current_url, page_title_for_filename)
+
+                new_links = get_internal_links(page, base_url)
+                for link in new_links:
+                    if link not in visited_urls:
+                        urls_to_visit.append(link)
+                
+                print(f"  Found {len(new_links)} internal links. {len(urls_to_visit)} links in queue.")
+
+                time.sleep(delay) 
+            except Exception as e:
+                print(f"[ERROR] Failed to crawl {current_url}: {e}")
+                # Optionally, re-add to end of queue or log for later retry
+
+        browser.close()
+        print(f"\nCrawl finished. Visited {crawled_page_count} pages.")
+
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    main()
+    if os.path.exists(OUTPUT_DIR):
+        print(f"Clearing existing data in {OUTPUT_DIR}...")
+        for file in os.listdir(OUTPUT_DIR):
+            if file.endswith(".json"):
+                os.remove(os.path.join(OUTPUT_DIR, file))
+        print("Existing JSON files cleared.")
+    else:
+        os.makedirs(OUTPUT_DIR)
+        print(f"Created output directory: {OUTPUT_DIR}")
+
+    crawl_website(BASE_URL, OUTPUT_DIR, MAX_PAGES_TO_CRAWL, CRAWL_DELAY_SECONDS, PLAYWRIGHT_TIMEOUT_MS)
+    print("\nWebsite parsing complete. Run create_vector_store.py next to update your vector database.")

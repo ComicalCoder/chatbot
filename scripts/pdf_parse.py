@@ -1,196 +1,139 @@
 import os
-import glob
 import json
+import hashlib
+from pypdf import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import re
-import pdfplumber
-from pathlib import Path
+import unicodedata
 
-def clean_text(text):
-    """Clean text by removing extra whitespace and normalizing."""
-    if not text:
-        return ""
-    text = re.sub(r'\s+', ' ', text.strip())
-    text = re.sub(r'[^\x00-\x7F]+', ' ', text)  # Remove non-ASCII characters
+# --- CONFIGURATION ---
+# Directory where your PDF files are located
+INPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "input_files")
+# Directory where the parsed JSON output will be saved
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+
+# Text splitting configuration (consistent with website_parse.py)
+TEXT_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    length_function=len,
+    is_separator_regex=False,
+)
+
+# --- HELPER FUNCTIONS ---
+
+def chunk_text(text, splitter=TEXT_SPLITTER):
+    """Split text into RAG-friendly chunks using the configured splitter."""
+    if not text or not text.strip():
+        return []
+    chunks = splitter.split_text(text)
+    return [c.strip() for c in chunks if c.strip()]
+
+def normalize_text(text):
+    """Normalize text: fix whitespace and Unicode issues."""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def extract_title(page):
-    """Extract title from the first page using keywords and font properties."""
-    text = page.extract_text() or ""
-    lines = text.split('\n')[:6]  # Check first 6 lines for title
-    title_parts = []
-    for line in lines:
-        line = clean_text(line)
-        # Look for title keywords
-        if any(keyword in line.upper() for keyword in ['PEKELILING', 'BIL.', 'PERKHIDMATAN']):
-            # Remove codes like [JPAN: ...] and stop at section markers
-            title_part = re.sub(r'\[.*?\]', '', line).strip()
-            title_part = re.split(r'(TUJUAN|LATAR BELAKANG|SABAH MAJU JAYA)', title_part, flags=re.IGNORECASE)[0].strip()
-            if title_part:
-                title_parts.append(title_part)
-        # Stop if we hit a section marker or empty line
-        if re.search(r'^(TUJUAN|LATAR BELAKANG|\d+\.\s|$)', line, re.IGNORECASE):
-            break
-    
-    title = ' '.join(title_parts).strip()
-    
-    # Fallback: Check for bold or large font
-    if not title or len(title) < 10 or title.upper() in ['NEGERI SABAH', 'SABAH']:  # Avoid vague titles
-        for char in page.chars:
-            if char.get('size', 0) > 12 or 'Bold' in char.get('fontname', ''):  # Adjust threshold as needed
-                title_text = clean_text(char['text'])
-                if any(keyword in title_text.upper() for keyword in ['PEKELILING', 'BIL.', 'PERKHIDMATAN']):
-                    title = title_text
-                    break
-        else:
-            title = clean_text(lines[0]) if lines else "Untitled"
-    
-    return title if title else "Untitled"
+def save_documents_as_json(original_filepath, list_of_documents):
+    """Save a list of structured documents to a JSON file.
+    Filename is based on the original PDF name and a hash for uniqueness."""
+    if not list_of_documents:
+        print(f"  [Info] No documents to save for {original_filepath}.")
+        return
 
-def extract_tables(page):
-    """Extract tables from a page and convert to structured format."""
-    tables = []
-    for table in page.extract_tables():
-        if not table or len(table) == 0:
-            continue
-        # Clean headers, assign placeholders for empty ones
-        headers = [clean_text(h) if h else f"Column_{i}" for i, h in enumerate(table[0])]
-        # Filter headers: keep if non-placeholder or column has non-empty data
-        valid_indices = [
-            i for i, h in enumerate(headers)
-            if h and not h.startswith("Column_") or any(row[i] and row[i].strip() for row in table[1:] if i < len(row))
-        ]
-        if not valid_indices:
-            continue
-        filtered_headers = [headers[i] for i in valid_indices]
-        table_data = []
-        for row in table[1:]:
-            row_dict = {
-                filtered_headers[i]: clean_text(row[j]) if j < len(row) and row[j] else ""
-                for i, j in enumerate(valid_indices)
-            }
-            table_data.append(row_dict)
-        tables.append(table_data)
-    return tables
+    # Create a consistent filename based on the original PDF filename and its content hash
+    base_filename = os.path.basename(original_filepath)
+    # Remove extension and sanitize for filename
+    name_without_ext = os.path.splitext(base_filename)[0]
+    sanitized_name = re.sub(r'[^\w\s-]', '', name_without_ext).strip()
+    sanitized_name = re.sub(r'[-\s]+', '-', sanitized_name) # Replace spaces/multiple dashes with single dash
 
-def extract_forms(page_text, page_num):
-    """Extract form fields as key-value pairs with strict regex."""
-    forms = {}
-    if page_num == 1:  # Skip forms on page 1 to avoid title misdetection
-        return forms
-    lines = page_text.split('\n')
-    # Exclude section headers and common non-form keywords
-    exclude_keywords = {
-        'NEGERI', 'LATAR', 'LATAR BELAKANG', 'TUJUAN', 'TANGGUNGJAWAB', 'BERTUGAS',
-        'BERTUGAS RASMI', 'SABAH', 'PEKELILING', 'PERKHIDMATAN', 'TAFSIRAN', 'KADAR',
-        'SYARAT', 'JADUAL'
-    }
-    for line in lines:
-        # Match patterns like 'NAMA: value', 'JAWATAN value', or 'NAMA [value]'
-        # Ensure value doesn't start with a number or section-like text
-        match = re.match(r'^\s*(\d+\.\s+)?([A-Z\s]{1,15})\s*[:\s]+([^0-9\s][^\n[]+)$', line)
-        if match:
-            key = clean_text(match.group(2)).replace(' ', '')  # Normalize key for exclusion check
-            if key in exclude_keywords:
-                continue
-            value = clean_text(match.group(3))
-            if len(value.split()) > 50:  # Skip if value is too long (likely a paragraph)
-                continue
-            forms[clean_text(match.group(2))] = value
-        else:
-            # Try fields without colons (e.g., 'NAMA [value]')
-            match = re.match(r'^\s*(\d+\.\s+)?([A-Z\s]{1,15})\s+\[([^\]]*)\]$', line)
-            if match:
-                key = clean_text(match.group(2)).replace(' ', '')  # Normalize key
-                if key in exclude_keywords:
-                    continue
-                value = clean_text(match.group(3))
-                if len(value.split()) > 50:
-                    continue
-                forms[clean_text(match.group(2))] = value
-    return forms
+    # Use a hash of the file path and content to ensure uniqueness
+    file_hash = hashlib.md5(original_filepath.encode('utf-8')).hexdigest()
 
-def chunk_text(text):
-    """Split text into paragraphs for LLM-friendliness."""
-    paragraphs = [clean_text(p) for p in text.split('\n\n') if p.strip()]
-    return paragraphs
+    output_filename = f"{sanitized_name}_{file_hash}.json"
+    filepath = os.path.join(OUTPUT_DIR, output_filename)
 
-def parse_pdf(pdf_path):
-    """Parse a single PDF and return structured data."""
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            title = None
-            pages_data = []
-            for page_num, page in enumerate(pdf.pages, 1):
-                # Extract text
-                text = page.extract_text() or ""
-                text = clean_text(text)
-                
-                # Extract title from first page
-                if page_num == 1:
-                    title = extract_title(page)
-                
-                # Extract tables
-                tables = extract_tables(page)
-                
-                # Extract forms
-                forms = extract_forms(text, page_num)
-                
-                # Chunk text into paragraphs
-                paragraphs = chunk_text(text)
-                
-                # Structure page data
-                page_data = {
-                    "page_num": page_num,
-                    "paragraphs": paragraphs,
-                    "tables": tables,
-                    "forms": forms
-                }
-                pages_data.append(page_data)
-            
-            # Add metadata
-            metadata = {
-                "page_count": len(pdf.pages),
-                "file_size_bytes": os.path.getsize(pdf_path)
-            }
-            
-            print(f"Parsed {pdf_path}: Title='{title}', Pages={len(pages_data)}, Tables={sum(len(p['tables']) for p in pages_data)}, Forms={sum(len(p['forms']) for p in pages_data)}")
-            
-            return {
-                "filename": os.path.basename(pdf_path),
-                "title": title or "Untitled",
-                "metadata": metadata,
-                "pages": pages_data
-            }
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(list_of_documents, f, ensure_ascii=False, indent=2)
+        print(f"✅ Saved {len(list_of_documents)} documents from '{base_filename}' to '{filepath}'")
     except Exception as e:
-        print(f"Error parsing {pdf_path}: {str(e)}")
-        return None
+        print(f"[ERROR] Failed to save JSON for '{base_filename}': {e}")
+
+# --- MAIN PDF PARSING LOGIC ---
+
+def parse_pdf(filepath):
+    """
+    Parses a PDF file, extracts text page by page, chunks it,
+    and returns a list of structured documents.
+    """
+    documents = []
+    pdf_name = os.path.basename(filepath)
+    print(f"📄 Processing PDF: '{pdf_name}'")
+
+    try:
+        reader = PdfReader(filepath)
+        num_pages = len(reader.pages)
+        full_text = []
+
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text:
+                full_text.append(normalize_text(text))
+            print(f"  Extracted text from page {i+1}/{num_pages}")
+
+        combined_text = "\n\n".join(full_text)
+
+        if not combined_text.strip():
+            print(f"  [Warning] No readable text extracted from '{pdf_name}'. Skipping.")
+            return []
+
+        # Chunk the combined text
+        text_chunks = chunk_text(combined_text)
+
+        for idx, chunk_content in enumerate(text_chunks):
+            documents.append({
+                "page_content": chunk_content,
+                "metadata": {
+                    "source_file": pdf_name,
+                    "original_path": filepath,
+                    "type": "pdf_content",
+                    "chunk_index": idx,
+                    "total_chunks": len(text_chunks),
+                    "num_pages": num_pages,
+                    "title": os.path.splitext(pdf_name)[0] # Use filename as title
+                }
+            })
+        print(f"  [Info] Generated {len(documents)} document chunks from '{pdf_name}'.")
+    except Exception as e:
+        print(f"[ERROR] Failed to parse PDF '{pdf_name}': {e}")
+        return []
+
+    return documents
+
+# --- MAIN EXECUTION ---
 
 def main():
-    """Parse all PDFs in input_files/ and save JSONs to data/."""
-    input_dir = Path("~/chatbot/input_files").expanduser()
-    output_dir = Path("~/chatbot/data").expanduser()
-    
-    # Ensure output directory exists
-    output_dir.mkdir(exist_ok=True)
-    
-    # Find all PDFs
-    pdf_files = glob.glob(str(input_dir / "*.pdf"))
-    print(f"Found {len(pdf_files)} PDFs in {input_dir}")
-    
-    for pdf_path in pdf_files:
-        print(f"Processing {pdf_path}...")
-        parsed_data = parse_pdf(pdf_path)
-        if parsed_data:
-            # Generate JSON filename with 'pdf_' prefix
-            json_filename = f"pdf_{os.path.splitext(os.path.basename(pdf_path))[0]}.json"
-            json_path = output_dir / json_filename
-            
-            # Save JSON
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(parsed_data, f, ensure_ascii=False, indent=2)
-            print(f"Saved parsed data to {json_path}")
-        else:
-            print(f"Skipped {pdf_path} due to parsing error")
+    # Ensure input and output directories exist
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print(f"Starting PDF parsing from '{INPUT_DIR}'...")
+
+    pdf_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith('.pdf')]
+
+    if not pdf_files:
+        print(f"No PDF files found in '{INPUT_DIR}'. Please place your PDFs there.")
+        return
+
+    for pdf_file in pdf_files:
+        pdf_filepath = os.path.join(INPUT_DIR, pdf_file)
+        documents = parse_pdf(pdf_filepath)
+        save_documents_as_json(pdf_filepath, documents)
+
+    print("PDF parsing finished.")
 
 if __name__ == "__main__":
     main()
